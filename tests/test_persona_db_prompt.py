@@ -14,6 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 
 
 def load_mixin(path):
+    """Load only the shared helper, without importing a live provider."""
     spec = importlib.util.spec_from_file_location("persona_prompt_under_test", path)
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
@@ -21,6 +22,7 @@ def load_mixin(path):
 
 
 def make_provider(tmp_path, mixin, name="default"):
+    """Create an isolated store with production persona admission constraints."""
     conn = sqlite3.connect(tmp_path / f"{name}.db")
     conn.executescript("""
         CREATE TABLE working_memory (id TEXT PRIMARY KEY, content TEXT);
@@ -28,7 +30,8 @@ def make_provider(tmp_path, mixin, name="default"):
         CREATE TABLE memoria_timelines (source_memory_id TEXT, topic TEXT);
         CREATE TABLE memoria_persona (
             id INTEGER PRIMARY KEY AUTOINCREMENT, session_id TEXT DEFAULT 'default',
-            tier TEXT, topic TEXT, content TEXT, confidence REAL DEFAULT 0.7,
+            tier TEXT NOT NULL CHECK(tier IN ('permanent','long_term','working')),
+            topic TEXT NOT NULL, content TEXT NOT NULL, confidence REAL DEFAULT 0.7,
             source_memory_id TEXT, promotion_reason TEXT,
             reinforcement_count INTEGER DEFAULT 0,
             last_reinforced_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -44,10 +47,12 @@ def make_provider(tmp_path, mixin, name="default"):
 
 @pytest.fixture
 def mixin():
+    """Supply a freshly loaded helper so environment defaults are testable."""
     return load_mixin(ROOT / "mnemosyne/integrations/hermes_persona_prompt.py")
 
 
 def insert(provider, content, tier="permanent", topic="general", count=0):
+    """Insert a complete synthetic persona rule into the isolated store."""
     conn = provider._beam.conn
     conn.execute(
         "INSERT INTO memoria_persona (tier,topic,content,reinforcement_count) VALUES (?,?,?,?)",
@@ -57,6 +62,7 @@ def insert(provider, content, tier="permanent", topic="general", count=0):
 
 
 def test_actual_promotion_reaches_fresh_process_next_prompt(tmp_path, mixin):
+    """Actual promotion persists a non-null topic and reaches a new process."""
     provider = make_provider(tmp_path, mixin)
     conn = provider._beam.conn
     conn.execute("INSERT INTO working_memory VALUES ('source', 'Clean throwaway artifacts after work.')")
@@ -66,6 +72,9 @@ def test_actual_promotion_reaches_fresh_process_next_prompt(tmp_path, mixin):
     spec.loader.exec_module(adapter_module)
     result = json.loads(adapter_module.PersonaAdapter(provider._beam)._promote("source", "permanent"))
     assert result["status"] == "ok"
+    assert conn.execute("SELECT topic FROM memoria_persona").fetchone()[0] == "general"
+    with pytest.raises(sqlite3.IntegrityError):
+        conn.execute("INSERT INTO memoria_persona (tier,topic,content) VALUES ('permanent',NULL,'invalid')")
     conn.close()
     code = """
 import importlib.util, sqlite3, sys
@@ -90,6 +99,7 @@ print(p._with_persona_block('# Mnemosyne Memory'))
 
 
 def test_opt_out_reads_neither_file_nor_db(tmp_path, mixin):
+    """Disabled injection must not touch either backing source."""
     p = make_provider(tmp_path, mixin)
     p.PERSONA_ENABLED = False
     p._beam.conn.close()
@@ -98,11 +108,13 @@ def test_opt_out_reads_neither_file_nor_db(tmp_path, mixin):
 
 
 def test_opt_in_remains_required(monkeypatch):
+    """Storing a persona row does not silently opt users into injection."""
     monkeypatch.delenv("MNEMOSYNE_PERSONA_ENABLED", raising=False)
     assert not load_mixin(ROOT / "mnemosyne/integrations/hermes_persona_prompt.py").PERSONA_ENABLED
 
 
 def test_profile_bound_stores_do_not_mix(tmp_path, mixin):
+    """Reads follow the bound store and never a previous profile cache."""
     a = make_provider(tmp_path, mixin, "alpha")
     b = make_provider(tmp_path, mixin, "beta")
     insert(a, "alpha-only standing rule")
@@ -116,6 +128,7 @@ def test_profile_bound_stores_do_not_mix(tmp_path, mixin):
 
 
 def test_deterministic_tier_reinforcement_id_order(tmp_path, mixin):
+    """Tier, reinforcement, and stable insertion order determine selection."""
     p = make_provider(tmp_path, mixin)
     insert(p, "working-rule", "working", count=99)
     insert(p, "long-rule", "long_term", count=99)
@@ -129,6 +142,7 @@ def test_deterministic_tier_reinforcement_id_order(tmp_path, mixin):
 
 
 def test_hard_entry_bound(tmp_path, mixin):
+    """A generous byte budget cannot bypass the twenty-row SQL limit."""
     p = make_provider(tmp_path, mixin)
     for i in range(25):
         insert(p, f"rule-{i:02}")
@@ -140,6 +154,7 @@ def test_hard_entry_bound(tmp_path, mixin):
 
 @pytest.mark.parametrize("content", ["x" * 10000, "汉字" * 10000, "word " * 10000], ids=["unbroken", "cjk", "words"])
 def test_oversized_entry_skipped_whole_and_small_rule_survives(tmp_path, mixin, content):
+    """Oversized ASCII, CJK, and word entries are skipped without slicing."""
     p = make_provider(tmp_path, mixin)
     insert(p, content)
     insert(p, "small rule")
@@ -152,6 +167,7 @@ def test_oversized_entry_skipped_whole_and_small_rule_survives(tmp_path, mixin, 
 
 @pytest.mark.parametrize("cap", [-1, 0, 10])
 def test_nonpositive_or_tiny_budget_emits_nothing(tmp_path, mixin, cap):
+    """Only the DB path has the documented nonpositive-budget no-op."""
     p = make_provider(tmp_path, mixin)
     insert(p, "rule")
     p.PERSONA_TOKEN_CAP = cap
@@ -159,6 +175,7 @@ def test_nonpositive_or_tiny_budget_emits_nothing(tmp_path, mixin, cap):
 
 
 def test_empty_or_missing_table_is_noop(tmp_path, mixin):
+    """An empty or older store adds no behavioral section."""
     p = make_provider(tmp_path, mixin)
     assert p._with_persona_block("base") == "base"
     p._beam.conn.execute("DROP TABLE memoria_persona")
@@ -166,6 +183,7 @@ def test_empty_or_missing_table_is_noop(tmp_path, mixin):
 
 
 def test_file_path_stays_compatible(tmp_path, mixin):
+    """Nonempty legacy file content retains precedence over DB rows."""
     p = make_provider(tmp_path, mixin)
     insert(p, "DB rule")
     p.PERSONA_FILE = tmp_path / "persona.md"
@@ -175,7 +193,19 @@ def test_file_path_stays_compatible(tmp_path, mixin):
     assert "DB rule" in p._persona_block()
 
 
+def test_file_zero_budget_retains_legacy_truncation_notice(tmp_path, mixin):
+    """Document compatibility: zero file budget emits a notice, not file content."""
+    p = make_provider(tmp_path, mixin)
+    p.PERSONA_FILE = tmp_path / "persona.md"
+    p.PERSONA_FILE.write_text("legacy file rule", encoding="utf-8")
+    p.PERSONA_TOKEN_CAP = 0
+    block = p._persona_block()
+    assert "truncated" in block
+    assert "legacy file rule" not in block
+
+
 def test_demotion_visible_without_restart(tmp_path, mixin):
+    """Committed removal is reflected by the next uncached DB read."""
     p = make_provider(tmp_path, mixin)
     insert(p, "retirable rule")
     assert "retirable" in p._persona_block()
@@ -186,6 +216,7 @@ def test_demotion_visible_without_restart(tmp_path, mixin):
 
 @pytest.mark.parametrize("package", ["hermes_memory_provider", "mnemosyne_hermes"])
 def test_real_provider_system_prompt_reads_only_bound_store(tmp_path, mixin, package, monkeypatch):
+    """Both provider surfaces emit rules only from the currently bound store."""
     import importlib
     importlib.import_module("mnemosyne.integrations.hermes_persona_prompt")  # core before host discovery
     module = importlib.import_module(package)

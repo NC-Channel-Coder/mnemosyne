@@ -377,8 +377,10 @@ uses a conservative UTF-8 byte budget equal to `MNEMOSYNE_PERSONA_TOKEN_CAP`
 (default **1500 bytes**, including the persona header), not the legacy file
 path's approximate word-count budget. Complete entries that do not fit are
 skipped rather than sliced; this may include fewer facts than a model-specific
-tokenizer would allow. An empty/missing store or nonpositive budget injects
-nothing. Disabling the flag suppresses both file and DB reads. Promotion and
+tokenizer would allow. On the DB fallback path, an empty/missing store or a
+nonpositive budget injects nothing. The legacy file path retains its existing
+approximate truncation behavior (including its truncation notice at zero budget).
+Disabling the flag suppresses both file and DB reads. Promotion and
 demotion are reflected when the next system prompt is built.
 
 ### Install profile comparison
