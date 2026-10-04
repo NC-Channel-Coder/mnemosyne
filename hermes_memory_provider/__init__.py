@@ -546,6 +546,16 @@ CROSS_SESSION_RESOLVE_SCHEMA = {
                 "description": "If true, report what would be resolved without writing changes.",
                 "default": False,
             },
+            "llm_eval": {
+                "type": "boolean",
+                "description": (
+                    "Only meaningful with dry_run=true: also run LLM verification on "
+                    "flagged pairs (without mutating) so the exact apply-time verdict "
+                    "can be previewed. Default false keeps the dry run deterministic "
+                    "(no LLM calls)."
+                ),
+                "default": False,
+            },
         },
     },
 }
@@ -3180,7 +3190,10 @@ class MnemosyneMemoryProvider(HermesPersonaPromptMixin, MemoryProvider):
             skip = self._reserve_reflection_budget("tool")
             if skip is not None:
                 return json.dumps(skip)
-        result = self._beam.resolve_cross_session_conflicts(dry_run=dry_run)
+        result = self._beam.resolve_cross_session_conflicts(
+            dry_run=dry_run,
+            llm_eval=bool(args.get("llm_eval", False)),
+        )
         if not dry_run and int(result.get("invalidated", 0)):
             try:
                 self._audit_event(
